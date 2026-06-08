@@ -1,0 +1,26 @@
+ClaudeSlate — third-party notices
+==================================
+
+ClaudeSlate is an unofficial, community project. It is not affiliated with,
+sponsored by, or endorsed by Anthropic.
+
+Trademarks
+----------
+"Claude" and the Claude logo are trademarks of Anthropic, PBC.
+
+Not bundled (you fetch these separately)
+----------------------------------------
+* ST7305_U8g2.h / ST7305_U8g2.cpp — the ST7305 reflective-LCD driver for this board.
+    Source: Waveshare ESP32-S3-RLCD-4.2 demo, 02_Example/Arduino/10_U8G2_Test/
+    https://github.com/waveshareteam/ESP32-S3-RLCD-4.2
+    Copy these into firmware/claude_slate/ before building. They are Waveshare's
+    code and are deliberately NOT redistributed in this repository.
+* U8g2 (patched build with u8x8_d_st7305) — ships in the same Waveshare repo under
+    01_Arduino_Libraries/U8g2. Upstream U8g2 is by Oliver Kraus (BSD-2-Clause):
+    https://github.com/olikraus/u8g2
+
+Runtime dependencies / services
+-------------------------------
+* ArduinoJson — Benoit Blanchon — MIT
+* Weather data — Open-Meteo (https://open-meteo.com), free, no API key. CC BY 4.0.
+* Onboard sensor: Sensirion SHTC3 (read with a tiny inline I2C routine).
