@@ -74,6 +74,21 @@ bool shtc3Read(float& t, float& h) {
   return true;
 }
 
+// ---------------------- Battery (ADC GPIO4, 1/3 divider; this board has no fuel gauge) ----------------------
+#define BAT_ADC_PIN 4                              // ESP32-S3 ADC1_CH3 = GPIO4 (per Waveshare 03_ADC_Test)
+int g_bat = -1;
+int readBattery() {                                // battery mV = pin mV x3 -> 3.00V=0% 4.12V=100%
+  long sum = 0; int n = 0;
+  for (int i = 0; i < 8; i++) { int mv = analogReadMilliVolts(BAT_ADC_PIN); if (mv > 0) { sum += mv; n++; } delay(2); }
+  if (n == 0) return g_bat;
+  int mv = (int)(sum / n) * 3;                     // undo the 1/3 divider
+  if (mv < 2500 || mv > 4600) return g_bat;        // no battery / out of range -> keep last (-1 = don't draw)
+  float v = mv / 1000.0;
+  int pct = (v < 3.0) ? 0 : (v > 4.12 ? 100 : (int)round((v - 3.0) / 1.12 * 100));
+  if (g_bat >= 0 && abs(pct - g_bat) < 2) return g_bat;   // ignore +/-1 jitter
+  return pct;
+}
+
 // ---------------------- 绘制小工具 ----------------------
 void strAt(int x, int y, const char* s) { u->drawStr(x, y, s); }
 void strCenter(int cx, int y, const char* s) { u->drawStr(cx - u->getStrWidth(s) / 2, y, s); }
@@ -141,6 +156,20 @@ void bar(int x, int y, int w, int h, float frac) {
   int n = (int)round(constrain(frac, 0.0f, 1.0f) * (w - 4));
   if (n > 0) u->drawBox(x + 2, y + 2, n, h - 4);
 }
+// Battery icon: whole group right-aligned to rx, returns left edge. Frame + fill + % text.
+int drawBatteryRight(int rx, int yTop, int pct) {
+  if (pct < 0) return rx;
+  char b[6]; snprintf(b, sizeof(b), "%d%%", pct);
+  u->setFont(u8g2_font_6x13_tf);
+  int total = 24 + 4 + u->getStrWidth(b);          // battery (22 frame + 2 nub) + gap + %
+  int bx = rx - total;
+  u->drawFrame(bx, yTop, 22, 11);
+  u->drawBox(bx + 22, yTop + 3, 2, 5);             // positive nub
+  int fw = (int)round(pct / 100.0 * 18);
+  if (fw > 0) u->drawBox(bx + 2, yTop + 2, fw, 7);
+  u->drawStr(bx + 28, yTop + 10, b);
+  return bx;
+}
 
 // 黑字白底：整帧像素取反后再送(配合未改动的官方驱动，其默认 0x21=反显开)
 void flush() {
@@ -156,6 +185,7 @@ void flush() {
 void render() {
   u->clearBuffer();
   u->setDrawColor(1);
+  g_bat = readBattery();                            // ADC battery voltage -> %
   struct tm t; bool haveT = timeOK && getLocalTime(&t, 50);
 
   // ---- 顶部：时钟 + 日期 + 今日天气 ----
@@ -221,7 +251,10 @@ void render() {
   if (!g.ok) snprintf(st, sizeof(st), "proxy: no data");
   else if (haveT) snprintf(st, sizeof(st), "%s %02d:%02d", g.stale ? "stale" : "ok", t.tm_hour, t.tm_min);
   else snprintf(st, sizeof(st), g.ok ? "ok" : "...");
-  u->drawStr(W - 16 - u->getStrWidth(st), 276, st);
+  // battery icon bottom-right, status text to its left
+  int batL = drawBatteryRight(W - 12, 265, g_bat);
+  u->setFont(u8g2_font_6x13_tf);
+  u->drawStr(batL - 14 - u->getStrWidth(st), 276, st);
 
   flush();
 }

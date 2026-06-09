@@ -8,7 +8,8 @@ sips power, always‑on, easy on the eyes.
 
 It's the flat sibling of [ClaudeOrb](https://github.com/HarryXin0919/ClaudeOrb): same idea
 (your real Claude session/weekly limits, read from your local Claude Code login — no API
-key), plus a big clock, today's weather, a 5‑day forecast, and the room's temperature.
+key), plus a big clock, today's weather, a 5‑day forecast, the room's temperature, and the
+battery level.
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -22,7 +23,7 @@ key), plus a big clock, today's weather, a 5‑day forecast, and the room's temp
 │   23°     25°     32°     33°     35°         │
 │   20°     18°     15°     20°     22°         │
 ├──────────────────────────────────────────────┤
-│  Room 26.5C  58%RH                  ok 14:32  │  room temp/humidity · status
+│  Room 26.5C 58%RH        ok 14:32   [▮▮▯] 84%│  room · status · battery
 └──────────────────────────────────────────────┘
 ```
 
@@ -33,7 +34,10 @@ key), plus a big clock, today's weather, a 5‑day forecast, and the room's temp
 A tiny Python **proxy on your PC** reads the OAuth token Claude Code already stores
 locally, calls Anthropic's usage endpoint, also fetches the weather from **Open‑Meteo**
 (free, no key), and serves one small JSON on your LAN. The ESP32 polls that over Wi‑Fi.
-Time comes from NTP; the room temperature is read from the board's onboard **SHTC3**.
+Time comes from NTP; the room temperature is read from the board's onboard **SHTC3**, and
+the battery percentage is read from the battery‑voltage **ADC** (GPIO4, the divider the
+Waveshare board uses). This board has no fuel‑gauge IC, so it shows the level only — no
+charging indicator.
 
 ```
 ~/.claude/.credentials.json ─┐
