@@ -1,10 +1,12 @@
 /* ============================================================================
    ClaudeSlate — Claude usage + clock + weather on a Waveshare ESP32-S3-RLCD-4.2
-   (ST7305 400x300 reflective LCD). Top: clock + date + today's weather.
-   Middle: Claude SESSION / WEEKLY. Bottom: 5-day forecast + room temp/humidity.
+   (ST7305 400x300 reflective LCD). 3 pages, BOOT (GPIO0) cycles them:
+     P1 HOME    — clock + current weather + Claude overview (today $ / 7d spark) + 5-day
+     P2 CLAUDE  — tier table (5h/Week/Sonnet/Opus/Extra) + 7-day chart + spend + active
+     P3 WEATHER — current (feels/hum/wind) + next-12h trend + 5-day range + room/comfort
 
    Data: claude_limits_proxy.py (Claude usage + Open-Meteo weather). Time via NTP;
-   room temp/humidity from the onboard SHTC3.
+   room temp/humidity from the onboard SHTC3; battery from ADC (GPIO4, no fuel gauge).
 
    DRIVER (not bundled): copy ST7305_U8g2.h / ST7305_U8g2.cpp NEXT TO this .ino from
    Waveshare's official demo  https://github.com/waveshareteam/ESP32-S3-RLCD-4.2
@@ -39,6 +41,7 @@ const uint32_t RENDER_MS = 10000;    // full redraw (incl. clock)
 #define I2C_SDA 13
 #define I2C_SCL 14
 #define SHTC3_ADDR 0x70
+#define BTN_PIN 0       // BOOT 键，翻页
 #define W 400
 #define H 300
 
@@ -50,12 +53,23 @@ struct WxDay { char d[6]; int c, hi, lo; };
 struct Data {
   bool ok = false, stale = false;
   float sessionPct = 0, weekPct = 0;
-  int  wxNowT = 0, wxNowC = -1;
+  long  sessionReset = 0, weekReset = 0, sonnetReset = -1, opusReset = -1, extraReset = -1, activeIdle = -1;
+  float sonnetPct = -1, opusPct = -1, extraPct = -1; bool extraEnabled = false;
+  float costToday = 0, cost7d = 0, cost30d = 0;
+  int64_t tokToday = 0, tokIn = 0, tokOut = 0, activeTok = 0, weekTok = 0, tok7d[7] = {0};
+  int   activeMsgs = 0;
+  char  plan[16] = "", activeProj[24] = "";
+  int   wxNowT = 0, wxNowC = -1, wxFeels = 0, wxHum = 0, wxWind = 0;
+  int   h12t[12] = {0}, h12p[12] = {0}, nH12 = 0;
+  char  wxCity[16] = "";
   WxDay days[5]; int nDays = 0;
   float roomT = 0, roomH = 0; bool roomOk = false;
+  uint32_t fetchMs = 0;
 } g;
 uint32_t lastPoll = 0, lastRender = 0;
 bool timeOK = false;
+int  page = 0;                                      // 0=主页 1=Claude详情 2=天气&室内；BOOT 翻页
+int  lastBtn = HIGH; uint32_t lastBtnMs = 0;
 
 // ---------------------- SHTC3(标准 Wire) ----------------------
 bool shtc3Read(float& t, float& h) {
@@ -74,24 +88,43 @@ bool shtc3Read(float& t, float& h) {
   return true;
 }
 
-// ---------------------- Battery (ADC GPIO4, 1/3 divider; this board has no fuel gauge) ----------------------
-#define BAT_ADC_PIN 4                              // ESP32-S3 ADC1_CH3 = GPIO4 (per Waveshare 03_ADC_Test)
+// ---------------------- 电量 (ADC GPIO4，1/3 分压；本板无电量计芯片) ----------------------
+#define BAT_ADC_PIN 4                              // ESP32-S3 ADC1_CH3 = GPIO4 (官方 demo 用法)
 int g_bat = -1;
-int readBattery() {                                // battery mV = pin mV x3 -> 3.00V=0% 4.12V=100%
+int readBattery() {                                // 电池电压(mV)=引脚×3 → 3.00V=0% 4.12V=100%
   long sum = 0; int n = 0;
   for (int i = 0; i < 8; i++) { int mv = analogReadMilliVolts(BAT_ADC_PIN); if (mv > 0) { sum += mv; n++; } delay(2); }
   if (n == 0) return g_bat;
-  int mv = (int)(sum / n) * 3;                     // undo the 1/3 divider
-  if (mv < 2500 || mv > 4600) return g_bat;        // no battery / out of range -> keep last (-1 = don't draw)
+  int mv = (int)(sum / n) * 3;                     // 还原 1/3 分压
+  if (mv < 2500 || mv > 4600) return g_bat;        // 没接电池/异常 → 保持上次(-1=不画)
   float v = mv / 1000.0;
   int pct = (v < 3.0) ? 0 : (v > 4.12 ? 100 : (int)round((v - 3.0) / 1.12 * 100));
-  if (g_bat >= 0 && abs(pct - g_bat) < 2) return g_bat;   // ignore +/-1 jitter
+  if (g_bat >= 0 && abs(pct - g_bat) < 2) return g_bat;   // ±1 抖动不动
   return pct;
 }
+
+// ---------------------- 格式化(第2页用) ----------------------
+String pctStr(float p) { if (p < 0) return "--"; char b[8]; snprintf(b, sizeof(b), "%.0f%%", p); return String(b); }
+String humanTok(int64_t t) { char b[16];
+  if (t >= 1000000) snprintf(b, sizeof(b), "%.1fM", t / 1000000.0);
+  else if (t >= 1000) snprintf(b, sizeof(b), "%.0fK", t / 1000.0);
+  else snprintf(b, sizeof(b), "%lld", (long long)t); return String(b); }
+String fmtReset(long s) { char b[16];
+  if (s <= 0) return "now";
+  if (s < 3600) snprintf(b, sizeof(b), "%ldm", s / 60);
+  else if (s < 86400) snprintf(b, sizeof(b), "%ldh %ldm", s / 3600, (s % 3600) / 60);
+  else snprintf(b, sizeof(b), "%ldd %ldh", s / 86400, (s % 86400) / 3600); return String(b); }
+String fmtIdle(long s) { char b[12];
+  if (s < 0) return "?";
+  if (s < 60) snprintf(b, sizeof(b), "%lds", s);
+  else if (s < 3600) snprintf(b, sizeof(b), "%ldm", s / 60);
+  else snprintf(b, sizeof(b), "%ldh", s / 3600); return String(b); }
+long liveReset(long base) { long r = base - (long)((millis() - g.fetchMs) / 1000); return r < 0 ? 0 : r; }
 
 // ---------------------- 绘制小工具 ----------------------
 void strAt(int x, int y, const char* s) { u->drawStr(x, y, s); }
 void strCenter(int cx, int y, const char* s) { u->drawStr(cx - u->getStrWidth(s) / 2, y, s); }
+void strRight(int rx, int y, const char* s) { u->drawStr(rx - u->getStrWidth(s), y, s); }
 // 数字 + 小圆圈度数, 居中于 cx, 基线 y
 void tempCenter(int cx, int y, int v) {
   char b[8]; snprintf(b, sizeof(b), "%d", v);
@@ -136,11 +169,11 @@ void drawWx(int cx, int cy, int type) {           // 图标中心 (cx,cy)
       break;
     case ICON_RAIN:
       drawCloud(cx, cy - 4, 8);
-      for (int i = -1; i <= 1; i++) u->drawLine(cx + i * 7, cy + 10, cx + i * 7 - 2, cy + 16);
+      for (int i = -1; i <= 1; i++) u->drawLine(cx + i * 6, cy + 8, cx + i * 6 - 2, cy + 12);
       break;
     case ICON_SNOW:
       drawCloud(cx, cy - 4, 8);
-      for (int i = -1; i <= 1; i++) { u->drawDisc(cx + i * 8, cy + 13, 2); }
+      for (int i = -1; i <= 1; i++) { u->drawDisc(cx + i * 7, cy + 11, 1); }
       break;
     case ICON_THUNDER:
       drawCloud(cx, cy - 4, 8);
@@ -156,15 +189,15 @@ void bar(int x, int y, int w, int h, float frac) {
   int n = (int)round(constrain(frac, 0.0f, 1.0f) * (w - 4));
   if (n > 0) u->drawBox(x + 2, y + 2, n, h - 4);
 }
-// Battery icon: whole group right-aligned to rx, returns left edge. Frame + fill + % text.
+// 电量图标：整组右对齐到 rx，返回左边界。电池框 + 电量条 + 右侧 %
 int drawBatteryRight(int rx, int yTop, int pct) {
   if (pct < 0) return rx;
   char b[6]; snprintf(b, sizeof(b), "%d%%", pct);
   u->setFont(u8g2_font_6x13_tf);
-  int total = 24 + 4 + u->getStrWidth(b);          // battery (22 frame + 2 nub) + gap + %
+  int total = 24 + 4 + u->getStrWidth(b);          // 电池(框22+正极头2) + 间距 + %
   int bx = rx - total;
   u->drawFrame(bx, yTop, 22, 11);
-  u->drawBox(bx + 22, yTop + 3, 2, 5);             // positive nub
+  u->drawBox(bx + 22, yTop + 3, 2, 5);             // 正极头
   int fw = (int)round(pct / 100.0 * 18);
   if (fw > 0) u->drawBox(bx + 2, yTop + 2, fw, 7);
   u->drawStr(bx + 28, yTop + 10, b);
@@ -181,81 +214,254 @@ void flush() {
   (*u).sendBuffer();
 }
 
+// ---------------------- 渲染辅助 ----------------------
+#define FS u8g2_font_helvR08_tf                     // 小号字(单位/副标/倒计时)
+const char* wxText(int c) {
+  if (c < 0) return "";
+  if (c <= 0) return "Clear";
+  if (c <= 2) return "P.Cloudy";
+  if (c == 3) return "Cloudy";
+  if (c == 45 || c == 48) return "Fog";
+  if ((c >= 71 && c <= 77) || c == 85 || c == 86) return "Snow";
+  if (c >= 95) return "Storm";
+  if ((c >= 51 && c <= 67) || (c >= 80 && c <= 82)) return "Rain";
+  return "Cloudy";
+}
+const char* comfort(float t, float h) {
+  if (h < 35) return "DRY";
+  if (h > 65) return "HUMID";
+  if (t > 26) return "WARM";
+  if (t < 19) return "COOL";
+  return "OK";
+}
+int64_t maxTok7() { int64_t m = 0; for (int i = 0; i < 7; i++) if (g.tok7d[i] > m) m = g.tok7d[i]; return m; }
+// 7 根柱(按最大值归一)；today 列空心高亮
+void spark7(int x, int yBase, int pitch, int hMax, int todayIdx) {
+  int64_t mx = maxTok7(); if (mx < 1) mx = 1;
+  for (int i = 0; i < 7; i++) {
+    int bx = x + i * pitch, bw = pitch - 2;
+    int bh = (int)((double)hMax * g.tok7d[i] / mx); if (bh < 1 && g.tok7d[i] > 0) bh = 1;
+    if (bh <= 0) continue;
+    if (i == todayIdx) u->drawFrame(bx, yBase - bh, bw, bh);
+    else u->drawBox(bx, yBase - bh, bw, bh);
+  }
+}
+// 逐时温度折线 + 降水点
+void hourly12(int x, int y, int w, int h) {
+  int n = g.nH12; if (n < 2) return;
+  int mn = g.h12t[0], mx = g.h12t[0];
+  for (int i = 1; i < n; i++) { if (g.h12t[i] < mn) mn = g.h12t[i]; if (g.h12t[i] > mx) mx = g.h12t[i]; }
+  if (mx == mn) mx = mn + 1;
+  int pitch = w / (n - 1);
+  for (int i = 0; i < n - 1; i++) {
+    int y0 = y + h - (g.h12t[i]     - mn) * h / (mx - mn);
+    int y1 = y + h - (g.h12t[i + 1] - mn) * h / (mx - mn);
+    u->drawLine(x + i * pitch, y0, x + (i + 1) * pitch, y1);
+  }
+  for (int i = 0; i < n; i++) if (g.h12p[i] > 0) u->drawDisc(x + i * pitch, y + h + 6, g.h12p[i] > 50 ? 2 : 1);
+}
+// 浮动温度区间条：lo..hi 映射到固定窗(0..40°C)
+void rangeBar(int x, int y, int trackW, int h, int lo, int hi) {
+  u->drawFrame(x, y, trackW, h);
+  int xl = x + constrain(lo, 0, 40) * trackW / 40;
+  int xh = x + constrain(hi, 0, 40) * trackW / 40;
+  if (xh <= xl) xh = xl + 1;
+  u->drawBox(xl, y + 1, xh - xl, h - 2);
+}
+
 // ---------------------- 渲染 ----------------------
+// 底部公共栏：室温(+舒适度) + 状态点 + 电量。三页共用
+void drawBottom(bool haveT, struct tm* t) {
+  u->drawHLine(8, 258, W - 16);
+  u->setFont(u8g2_font_6x13_tf);
+  char room[48];
+  if (g.roomOk && page == 2) snprintf(room, sizeof(room), "Room %.1fC %.0f%%RH  %s", g.roomT, g.roomH, comfort(g.roomT, g.roomH));
+  else if (g.roomOk)         snprintf(room, sizeof(room), "Room %.1fC %.0f%%RH", g.roomT, g.roomH);
+  else                       snprintf(room, sizeof(room), "Room --");
+  u->drawStr(10, 276, room);
+  int batL = drawBatteryRight(W - 12, 265, g_bat);
+  const char* sl = !g.ok ? "no data" : (g.stale ? "stale" : "live");
+  bool live = g.ok && !g.stale;
+  u->setFont(u8g2_font_6x13_tf);
+  int sx = batL - 16 - u->getStrWidth(sl);
+  u->drawStr(sx, 276, sl);
+  if (live) u->drawDisc(sx - 9, 271, 3); else u->drawCircle(sx - 9, 271, 3);
+}
+
+// 第1页：时钟 + 当前天气 + Claude概览(含今日花费/7天) + 5天预报
+void renderPage1(bool haveT, struct tm* t) {
+  char hh[4] = "--", mm[4] = "--";
+  if (haveT) { snprintf(hh, sizeof(hh), "%02d", t->tm_hour); snprintf(mm, sizeof(mm), "%02d", t->tm_min); }
+  u->setFont(u8g2_font_logisoso32_tn);
+  u->drawStr(8, 40, hh);
+  int colX = 8 + u->getStrWidth(hh) + 6;
+  u->drawBox(colX, 17, 4, 4); u->drawBox(colX, 31, 4, 4);
+  u->drawStr(colX + 10, 40, mm);
+  u->setFont(FS);
+  if (haveT) {
+    const char* wd[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+    const char* mo[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    char ds[24]; snprintf(ds, sizeof(ds), "%s . %s %d", wd[t->tm_wday], mo[t->tm_mon], t->tm_mday);
+    u->drawStr(10, 54, ds);
+  }
+  u->drawVLine(150, 6, 48);
+  if (g.wxNowC >= 0) {                              // 当前天气(右上)
+    drawWx(176, 26, wxType(g.wxNowC));
+    u->setFont(u8g2_font_logisoso20_tn);
+    char nt[6]; snprintf(nt, sizeof(nt), "%d", g.wxNowT);
+    u->drawStr(196, 36, nt);
+    int tw = u->getStrWidth(nt);
+    u->drawCircle(196 + tw + 4, 22, 2);
+    u->setFont(FS);
+    char fl[12]; snprintf(fl, sizeof(fl), "feels %d", g.wxFeels); u->drawStr(248, 24, fl);
+    char w2[28]; snprintf(w2, sizeof(w2), "%s  %d%%RH %dkm/h", wxText(g.wxNowC), g.wxHum, g.wxWind);
+    u->drawStr(196, 50, w2);
+  }
+  u->drawHLine(8, 60, W - 16); u->drawHLine(8, 61, W - 16);
+
+  u->setFont(u8g2_font_helvB12_tf);                 // Claude 概览
+  u->drawStr(10, 78, "CLAUDE");
+  u->setFont(FS);
+  { String pl = String(g.plan); pl.toUpperCase(); u->drawStr(82, 78, pl.c_str()); }
+  char cost[12]; snprintf(cost, sizeof(cost), "~$%.2f", g.costToday);
+  u->setFont(u8g2_font_helvB12_tf); strRight(W - 10, 78, cost);
+  int cw = u->getStrWidth(cost);
+  u->setFont(u8g2_font_6x13_tf);
+  strRight(W - 10 - cw - 10, 78, (String("today ") + humanTok(g.tokToday) + " tok").c_str());
+  u->drawStr(10, 97, "SESS"); bar(56, 87, 130, 11, g.sessionPct / 100.0);
+  u->drawStr(196, 97, pctStr(g.sessionPct).c_str());
+  u->setFont(FS); strRight(W - 10, 97, (String("resets ") + fmtReset(liveReset(g.sessionReset))).c_str());
+  u->setFont(u8g2_font_6x13_tf);
+  u->drawStr(10, 113, "WEEK"); bar(56, 103, 130, 11, g.weekPct / 100.0);
+  u->drawStr(196, 113, pctStr(g.weekPct).c_str());
+  u->setFont(FS); strRight(W - 10, 113, (String("resets ") + fmtReset(liveReset(g.weekReset))).c_str());
+  u->drawStr(10, 131, "7d"); spark7(30, 132, 12, 15, 6);
+  char wk[40]; snprintf(wk, sizeof(wk), "wk %s   pk %s", humanTok(g.weekTok).c_str(), humanTok(maxTok7()).c_str());
+  strRight(W - 10, 129, wk);
+  u->drawHLine(8, 137, W - 16); u->drawHLine(8, 138, W - 16);
+
+  for (int i = 0; i < g.nDays && i < 5; i++) {      // 5天预报
+    int cx = 40 + i * 80;
+    u->setFont(FS); strCenter(cx, 154, g.days[i].d);
+    drawWx(cx, 176, wxType(g.days[i].c));
+    u->setFont(u8g2_font_helvB12_tf); tempCenter(cx, 213, g.days[i].hi);
+    u->setFont(FS); tempCenter(cx, 229, g.days[i].lo);
+    if (i) u->drawVLine(i * 80, 144, 94);
+  }
+}
+
+// 第2页：Claude 详情(档位表 + 7天柱图 + 今日 + 活跃)
+void renderPage2(bool haveT, struct tm* t) {
+  u->setFont(u8g2_font_helvB12_tf);
+  u->drawStr(10, 22, "CLAUDE DETAILS");
+  u->setFont(FS);
+  { String pl = String(g.plan); pl.toUpperCase();
+    char hdr[28]; snprintf(hdr, sizeof(hdr), "%s   ~$%.2f today", pl.c_str(), g.costToday); strRight(W - 10, 20, hdr); }
+  u->drawHLine(8, 28, W - 16); u->drawHLine(8, 29, W - 16);
+  if (!g.ok) { u->setFont(u8g2_font_helvB12_tf); strCenter(W / 2, 150, "proxy: no data"); return; }
+
+  u->setFont(FS);                                   // 表头
+  u->drawStr(8, 44, "TIER"); u->drawStr(64, 44, "USAGE"); u->drawStr(196, 44, "PCT"); strRight(W - 10, 44, "RESETS IN");
+  const int BX = 64, BW = 110;
+  const char* nm[5] = {"5h ses", "Week", "Sonnet", "Opus", "Extra"};
+  float pc[5] = {g.sessionPct, g.weekPct, g.sonnetPct, g.opusPct, g.extraPct};
+  long  rs[5] = {liveReset(g.sessionReset), liveReset(g.weekReset), liveReset(g.sonnetReset), liveReset(g.opusReset), liveReset(g.extraReset)};
+  for (int i = 0; i < 5; i++) {
+    int y = 60 + i * 18;
+    u->setFont(u8g2_font_6x13_tf);
+    u->drawStr(8, y, nm[i]);
+    if (pc[i] >= 0) bar(BX, y - 10, BW, 12, pc[i] / 100.0);
+    u->drawStr(196, y, pctStr(pc[i]).c_str());
+    u->setFont(FS);
+    if (i == 4) u->drawStr(BX + BW + 3, y, g.extraEnabled ? "on" : "off");
+    if (pc[i] >= 0 && rs[i] >= 0) strRight(W - 10, y, fmtReset(rs[i]).c_str());
+  }
+  u->drawHLine(8, 142, W - 16);
+
+  u->setFont(FS);                                   // 7天柱图
+  u->drawStr(10, 156, "7-DAY TOKENS");
+  char ch[40]; snprintf(ch, sizeof(ch), "wk %s  avg %s  pk %s",
+                        humanTok(g.weekTok).c_str(), humanTok(g.weekTok / 7).c_str(), humanTok(maxTok7()).c_str());
+  strRight(W - 10, 156, ch);
+  spark7(44, 192, 30, 30, 6);
+  if (haveT) {
+    const char* wd[] = {"S","M","T","W","T","F","S"};
+    for (int i = 0; i < 7; i++) {
+      int dow = (t->tm_wday - (6 - i) + 7) % 7;
+      strCenter(44 + i * 30 + 14, 202, wd[dow]);
+    }
+  }
+  u->drawHLine(8, 208, W - 16);
+
+  u->setFont(u8g2_font_6x13_tf);                    // 花费:今日 / 7天 / 30天 美元
+  char sp[60]; snprintf(sp, sizeof(sp), "SPEND  today ~$%.0f   7d ~$%.0f   30d ~$%.0f", g.costToday, g.cost7d, g.cost30d);
+  u->drawStr(10, 222, sp);
+  u->drawStr(10, 237, (String("TODAY ") + humanTok(g.tokToday) + " tok  in " + humanTok(g.tokIn) + " out " + humanTok(g.tokOut)).c_str());
+  u->setFont(FS);                                   // 活跃会话(一行)
+  u->drawStr(10, 252, (String("ACTIVE ") + g.activeProj + "   " + String(g.activeMsgs) + " msg  idle " + fmtIdle(g.activeIdle)).c_str());
+}
+
+// 第3页：天气 & 室内
+void renderPage3(bool haveT, struct tm* t) {
+  u->setFont(u8g2_font_helvB12_tf);
+  u->drawStr(10, 22, (String("WEATHER  ") + (g.wxCity[0] ? g.wxCity : "")).c_str());
+  u->setFont(FS);
+  if (haveT) {
+    const char* wd[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+    const char* mo[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    char ds[28]; snprintf(ds, sizeof(ds), "%s %s %d  %02d:%02d", wd[t->tm_wday], mo[t->tm_mon], t->tm_mday, haveT ? t->tm_hour : 0, haveT ? t->tm_min : 0);
+    strRight(W - 10, 20, ds);
+  }
+  u->drawHLine(8, 28, W - 16); u->drawHLine(8, 29, W - 16);
+  if (g.wxNowC < 0) { u->setFont(u8g2_font_helvB12_tf); strCenter(W / 2, 130, "no weather data"); return; }
+
+  drawWx(42, 62, wxType(g.wxNowC));                 // 当前
+  u->setFont(u8g2_font_logisoso32_tn);
+  char nt[6]; snprintf(nt, sizeof(nt), "%d", g.wxNowT);
+  u->drawStr(80, 72, nt);
+  int tw = u->getStrWidth(nt);
+  u->setFont(u8g2_font_helvB12_tf);
+  u->drawCircle(80 + tw + 6, 46, 3);
+  u->drawStr(80 + tw + 14, 58, wxText(g.wxNowC));
+  u->setFont(FS);
+  char l1[14], l2[14], l3[16];
+  snprintf(l1, sizeof(l1), "feels %d", g.wxFeels);
+  snprintf(l2, sizeof(l2), "hum %d%%", g.wxHum);
+  snprintf(l3, sizeof(l3), "wind %dkm/h", g.wxWind);
+  u->drawStr(255, 48, l1); u->drawStr(255, 62, l2); u->drawStr(255, 76, l3);
+  u->drawHLine(8, 88, W - 16);
+
+  u->setFont(FS);                                   // 逐时 12 小时
+  u->drawStr(10, 102, "NEXT 12H");
+  if (g.nH12 >= 2) {
+    hourly12(80, 94, 300, 20);                          // (读全局 h12t/h12p/nH12)
+    char e0[6], eN[6];
+    snprintf(e0, sizeof(e0), "%d", g.h12t[0]); snprintf(eN, sizeof(eN), "%d", g.h12t[g.nH12 - 1]);
+    u->drawStr(80, 102, e0); strRight(W - 10, 102, eN);
+  }
+  u->drawHLine(8, 126, W - 16);
+
+  u->setFont(FS);                                   // 5天区间
+  u->drawStr(10, 140, "5-DAY"); strRight(W - 10, 140, "hi / lo");
+  for (int i = 0; i < g.nDays && i < 5; i++) {
+    int y = 156 + i * 19;
+    u->setFont(FS); u->drawStr(10, y, g.days[i].d);
+    rangeBar(70, y - 9, 220, 11, g.days[i].lo, g.days[i].hi);
+    u->setFont(u8g2_font_6x13_tf);
+    char hl[12]; snprintf(hl, sizeof(hl), "%d / %d", g.days[i].hi, g.days[i].lo);
+    strRight(W - 10, y, hl);
+  }
+}
+
 void render() {
   u->clearBuffer();
   u->setDrawColor(1);
-  g_bat = readBattery();                            // ADC battery voltage -> %
+  g_bat = readBattery();                            // ADC 读电池电压→%
   struct tm t; bool haveT = timeOK && getLocalTime(&t, 50);
-
-  // ---- 顶部：时钟 + 日期 + 今日天气 ----
-  char hh[4] = "--", mm[4] = "--";
-  if (haveT) { snprintf(hh, sizeof(hh), "%02d", t.tm_hour); snprintf(mm, sizeof(mm), "%02d", t.tm_min); }
-  u->setFont(u8g2_font_logisoso32_tn);
-  int cx0 = 10, cy0 = 44;
-  u->drawStr(cx0, cy0, hh);
-  int wHH = u->getStrWidth(hh);
-  int colX = cx0 + wHH + 7;
-  u->drawBox(colX, cy0 - 23, 5, 5); u->drawBox(colX, cy0 - 9, 5, 5);
-  u->drawStr(colX + 12, cy0, mm);
-
-  u->setFont(u8g2_font_helvB12_tf);
-  if (haveT) {
-    const char* wd[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-    const char* mo[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-    char date[24]; snprintf(date, sizeof(date), "%s, %s %d", wd[t.tm_wday], mo[t.tm_mon], t.tm_mday);
-    u->drawStr(170, 22, date);
-  }
-  // 今日天气(右上)
-  if (g.wxNowC >= 0) {
-    drawWx(330, 26, wxType(g.wxNowC));
-    u->setFont(u8g2_font_logisoso20_tn);
-    char nt[6]; snprintf(nt, sizeof(nt), "%d", g.wxNowT);
-    u->drawStr(352, 36, nt);
-    u->drawCircle(352 + u->getStrWidth(nt) + 3, 22, 2);
-  }
-  u->drawHLine(8, 56, W - 16);
-
-  // ---- Claude 用量 ----
-  u->setFont(u8g2_font_helvB12_tf);
-  u->drawStr(10, 78, "CLAUDE");
-  u->setFont(u8g2_font_6x13_tf);
-  char ps[8];
-  u->drawStr(110, 80, "SESSION"); bar(180, 70, 150, 12, g.sessionPct / 100.0);
-  snprintf(ps, sizeof(ps), "%.0f%%", g.sessionPct); u->drawStr(345, 80, ps);
-  u->drawStr(110, 100, "WEEKLY");  bar(180, 90, 150, 12, g.weekPct / 100.0);
-  snprintf(ps, sizeof(ps), "%.0f%%", g.weekPct); u->drawStr(345, 100, ps);
-  u->drawHLine(8, 112, W - 16);
-
-  // ---- 5天预报 ----
-  for (int i = 0; i < g.nDays && i < 5; i++) {
-    int cx = 40 + i * 80;
-    u->setFont(u8g2_font_helvB12_tf);
-    strCenter(cx, 134, g.days[i].d);
-    drawWx(cx, 168, wxType(g.days[i].c));
-    u->setFont(u8g2_font_helvB12_tf);
-    tempCenter(cx, 210, g.days[i].hi);
-    u->setFont(u8g2_font_6x13_tf);
-    tempCenter(cx, 232, g.days[i].lo);
-    if (i) u->drawVLine(i * 80, 122, 120);
-  }
-  u->drawHLine(8, 250, W - 16);
-
-  // ---- 底部：室温 + 状态 ----
-  u->setFont(u8g2_font_6x13_tf);
-  char room[40];
-  if (g.roomOk) snprintf(room, sizeof(room), "Room %.1fC  %.0f%%RH", g.roomT, g.roomH);
-  else snprintf(room, sizeof(room), "Room --");
-  u->drawStr(10, 276, room);
-  char st[28];
-  if (!g.ok) snprintf(st, sizeof(st), "proxy: no data");
-  else if (haveT) snprintf(st, sizeof(st), "%s %02d:%02d", g.stale ? "stale" : "ok", t.tm_hour, t.tm_min);
-  else snprintf(st, sizeof(st), g.ok ? "ok" : "...");
-  // battery icon bottom-right, status text to its left
-  int batL = drawBatteryRight(W - 12, 265, g_bat);
-  u->setFont(u8g2_font_6x13_tf);
-  u->drawStr(batL - 14 - u->getStrWidth(st), 276, st);
-
+  if (page == 0)      renderPage1(haveT, &t);
+  else if (page == 1) renderPage2(haveT, &t);
+  else                renderPage3(haveT, &t);
+  drawBottom(haveT, &t);
   flush();
 }
 
@@ -273,10 +479,38 @@ bool poll() {
   g.stale = doc["stale"] | false;
   g.sessionPct = doc["session_pct"] | 0.0;
   g.weekPct = doc["week_pct"] | 0.0;
+  g.sessionReset = doc["session_reset_s"] | 0L;
+  g.weekReset    = doc["week_reset_s"] | 0L;
+  g.sonnetPct    = doc["sonnet_pct"] | -1.0;
+  g.opusPct      = doc["opus_pct"] | -1.0;
+  g.extraPct     = doc["extra_pct"] | -1.0;
+  g.extraEnabled = doc["extra_enabled"] | false;
+  g.sonnetReset  = doc["sonnet_reset_s"] | -1L;
+  g.opusReset    = doc["opus_reset_s"] | -1L;
+  g.extraReset   = doc["extra_reset_s"] | -1L;
+  g.costToday    = doc["cost_today_usd"] | 0.0;
+  g.cost7d       = doc["cost_7d_usd"] | 0.0;
+  g.cost30d      = doc["cost_30d_usd"] | 0.0;
+  g.tokToday     = doc["tok_today"].as<int64_t>();
+  g.tokIn        = doc["tok_today_in"].as<int64_t>();
+  g.tokOut       = doc["tok_today_out"].as<int64_t>();
+  g.weekTok      = doc["week_tok"].as<int64_t>();
+  { JsonArray a = doc["tok_7d"]; int i = 0; for (JsonVariant v : a) { if (i >= 7) break; g.tok7d[i++] = v.as<int64_t>(); } }
+  g.activeTok    = doc["active_tok"].as<int64_t>();
+  g.activeMsgs   = doc["active_msgs"] | 0;
+  g.activeIdle   = doc["active_idle_s"] | -1L;
+  strlcpy(g.plan, doc["plan"] | "", sizeof(g.plan));
+  strlcpy(g.activeProj, doc["active_project"] | "?", sizeof(g.activeProj));
   JsonObject wx = doc["weather"];
   if (!wx.isNull()) {
-    g.wxNowT = wx["now_t"] | 0;
-    g.wxNowC = wx["now_c"] | -1;
+    g.wxNowT  = wx["now_t"] | 0;
+    g.wxNowC  = wx["now_c"] | -1;
+    g.wxFeels = wx["now_feels"] | g.wxNowT;
+    g.wxHum   = wx["now_hum"] | 0;
+    g.wxWind  = wx["now_wind"] | 0;
+    strlcpy(g.wxCity, wx["city"] | "", sizeof(g.wxCity));
+    JsonArray h = wx["hourly_12h"]; g.nH12 = 0;
+    for (JsonObject o : h) { if (g.nH12 >= 12) break; g.h12t[g.nH12] = o["t"] | 0; g.h12p[g.nH12] = o["p"] | 0; g.nH12++; }
     JsonArray ds = wx["days"];
     g.nDays = 0;
     for (JsonObject d : ds) {
@@ -288,6 +522,7 @@ bool poll() {
       g.nDays++;
     }
   }
+  g.fetchMs = millis();
   return true;
 }
 
@@ -303,6 +538,7 @@ void connectWiFi() {
 // ---------------------- setup / loop ----------------------
 void setup() {
   Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT_PULLUP);                  // BOOT 键翻页
   Wire.begin(I2C_SDA, I2C_SCL);
   lcd.begin(0, U8G2_R1);
   u = lcd.getU8g2();
@@ -322,6 +558,14 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+
+  // BOOT 键翻页(按下=LOW，去抖)
+  int b = digitalRead(BTN_PIN);
+  if (lastBtn == HIGH && b == LOW && now - lastBtnMs > 250) {
+    page = (page + 1) % 3; lastBtnMs = now; render(); lastRender = now;
+  }
+  lastBtn = b;
+
   if (now - lastPoll >= POLL_MS) {
     if (WiFi.status() != WL_CONNECTED) connectWiFi();
     poll();

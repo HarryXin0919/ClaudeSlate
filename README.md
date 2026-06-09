@@ -8,23 +8,27 @@ sips power, always‑on, easy on the eyes.
 
 It's the flat sibling of [ClaudeOrb](https://github.com/HarryXin0919/ClaudeOrb): same idea
 (your real Claude session/weekly limits, read from your local Claude Code login — no API
-key), plus a big clock, today's weather, a 5‑day forecast, the room's temperature, and the
-battery level.
+key). It has **three pages** — press the **BOOT** button to cycle them.
 
 ```
-┌──────────────────────────────────────────────┐
-│  14:32        Sun, Jun 8            [☁] 22°   │  clock · date · today
-├──────────────────────────────────────────────┤
-│  CLAUDE   SESSION ▮▮▮▮▮▮▯▯▯▯▯▯  29%           │  Claude usage
-│           WEEKLY  ▮▮▮▯▯▯▯▯▯▯▯▯  12%           │
-├──────────────────────────────────────────────┤
-│   Mon     Tue     Wed     Thu     Fri         │  5-day forecast
-│   [☁]     [☁]     [☀]     [🌧]    [☀]         │
-│   23°     25°     32°     33°     35°         │
-│   20°     18°     15°     20°     22°         │
-├──────────────────────────────────────────────┤
-│  Room 26.5C 58%RH        ok 14:32   [▮▮▯] 84%│  room · status · battery
-└──────────────────────────────────────────────┘
+PAGE 1 — HOME                                   PAGE 2 — CLAUDE
+┌──────────────────────────────────────────────┐ ┌──────────────────────────────────────────────┐
+│  14:32        │  [☀] 18°  feels 20            │ │ CLAUDE DETAILS          Max  ·  ~$34 today    │
+│  TUE · Jun 9  │   Clear  85%RH 2km/h          │ ├──────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤ │ TIER     USAGE          PCT    RESETS IN       │
+│ CLAUDE Max       today 30.1M tok      ~$34.23 │ │ 5h ses [###-------]      1%    4h 41m          │
+│ SESS [#---------]   1%        resets 4h 41m   │ │ Week   [##--------]    18%    3d 16h           │
+│ WEEK [##--------]  18%        resets 3d 16h   │ │ Sonnet [#---------]     0%    3d 16h           │
+│ 7d ▁▄▃▇█▂▁   wk 620M   pk 190M                │ │ Opus   [----------]    --                      │
+├──────────────────────────────────────────────┤ │ Extra  [##########]on  92%    11h              │
+│  TUE   WED   THU   FRI   SAT   (icons hi/lo)  │ ├──────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤ │ 7-DAY ▁▄▃▇█▂▁   wk 620M  avg 88M  pk 190M     │
+│  Room 28.0C 47%RH      live      [▮▮▮] 96%    │ │ SPEND today ~$34  7d ~$475  30d ~$1242         │
+└──────────────────────────────────────────────┘ │ TODAY 30.1M  in 30.0M out 0.1M                │
+                                                   │ ACTIVE finditem  38 msg  idle 2m              │
+PAGE 3 — WEATHER & ROOM: current temp + feels/    └──────────────────────────────────────────────┘
+humidity/wind, a next-12h temperature trend line,
+a 5-day hi/lo range bar, and room comfort.
 ```
 
 ---
@@ -32,8 +36,10 @@ battery level.
 ## How it works
 
 A tiny Python **proxy on your PC** reads the OAuth token Claude Code already stores
-locally, calls Anthropic's usage endpoint, also fetches the weather from **Open‑Meteo**
-(free, no key), and serves one small JSON on your LAN. The ESP32 polls that over Wi‑Fi.
+locally, calls Anthropic's usage endpoint, scans your local Claude Code logs to compute
+today's / 7‑day / 30‑day token use and a rough **USD spend estimate** (per‑model rates),
+also fetches the weather from **Open‑Meteo** (free, no key), and serves one small JSON on
+your LAN. The ESP32 polls that over Wi‑Fi.
 Time comes from NTP; the room temperature is read from the board's onboard **SHTC3**, and
 the battery percentage is read from the battery‑voltage **ADC** (GPIO4, the divider the
 Waveshare board uses). This board has no fuel‑gauge IC, so it shows the level only — no
