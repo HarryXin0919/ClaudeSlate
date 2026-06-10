@@ -84,6 +84,10 @@ python proxy/claude_limits_proxy.py
 - **Allow it through the firewall** (port 8787) when prompted.
 - Can't reach Anthropic/Open‑Meteo directly (e.g. mainland China)? set
   `UPSTREAM_PROXY=http://127.0.0.1:7890` (a local Clash/HTTP proxy).
+- **Security:** the proxy listens on your LAN and never returns your OAuth token —
+  only derived percentages. On a shared/untrusted network, set `PROXY_TOKEN=<secret>`
+  and append `?token=<secret>` to `PROXY_URL` in the firmware (or send
+  `Authorization: Bearer <secret>`); requests without it get 401.
 
 ### 2) Get the display driver (one‑time)
 
