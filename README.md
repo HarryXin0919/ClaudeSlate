@@ -80,13 +80,14 @@ python proxy/claude_limits_proxy.py
 - Set your **weather city** with env vars (default = Shanghai):
   `WX_LAT=40.71  WX_LON=-74.01  WX_CITY="New York"  python proxy/claude_limits_proxy.py`
   (latitude/longitude of your city; find them on any maps site).
-- Find your **PC's LAN IP** (`ipconfig` / `ip addr`) — you'll put it in the firmware.
-- **Allow it through the firewall** (port 8787) when prompted.
+- No need to look up your PC's IP — the screen **finds the proxy by UDP broadcast**
+  (port 8788) and follows it if your PC's IP changes.
+- **Allow it through the firewall** (TCP 8787 + UDP 8788) when prompted.
 - Can't reach Anthropic/Open‑Meteo directly (e.g. mainland China)? set
   `UPSTREAM_PROXY=http://127.0.0.1:7890` (a local Clash/HTTP proxy).
 - **Security:** the proxy listens on your LAN and never returns your OAuth token —
   only derived percentages. On a shared/untrusted network, set `PROXY_TOKEN=<secret>`
-  and append `?token=<secret>` to `PROXY_URL` in the firmware (or send
+  and set `#define NET_PROXY_QUERY "?token=<secret>"` in the firmware (or send
   `Authorization: Bearer <secret>`); requests without it get 401.
 
 ### 2) Get the display driver (one‑time)
@@ -101,8 +102,12 @@ This board's ST7305 driver isn't bundled here. From Waveshare's official demo
 
 ### 3) Flash the firmware
 
-Arduino **esp32 core 3.x**. Edit the top of `firmware/claude_slate/claude_slate.ino`
-(`WIFI_SSID` / `WIFI_PASS` — 2.4 GHz; `PROXY_URL` = `http://<PC-LAN-IP>:8787/usage`).
+Arduino **esp32 core 3.x**. Optionally edit the `NET_DEF_*` defaults at the top of
+`firmware/claude_slate/claude_slate.ino` (2.4 GHz WiFi only) — or just flash as-is:
+if the screen can't join WiFi it opens a **setup hotspot** (`ClaudeSlate-Setup`);
+join it from your phone, the config page pops up (or open `http://192.168.4.1`),
+pick your WiFi and save. The proxy is auto-discovered, so no IP to type. You can
+re-enter setup anytime by **holding BOOT for 3 s**.
 
 ```bash
 arduino-cli compile \

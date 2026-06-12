@@ -25,9 +25,15 @@
 #include "ST7305_U8g2.h"
 
 // ---------------------- EDIT THESE / 改这里 ----------------------
-const char* WIFI_SSID = "YOUR_WIFI_SSID";       // 2.4GHz only (ESP32-S3 has no 5GHz)
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char* PROXY_URL = "http://192.168.1.50:8787/usage";   // your PC's LAN IP
+// Factory defaults only — runtime config lives in NVS. If WiFi fails, the
+// device opens a setup hotspot (captive portal) so you never need to reflash;
+// the proxy is found via UDP broadcast, so its IP may change freely.
+#define NET_DEF_SSID       "YOUR_WIFI_SSID"     // 2.4GHz only (ESP32-S3 has no 5GHz)
+#define NET_DEF_PASS       "YOUR_WIFI_PASSWORD"
+#define NET_DEF_PROXY_HOST "192.168.1.50"       // fallback when discovery fails
+#define NET_DEF_PROXY_PORT 8787
+#define NET_AP_NAME        "ClaudeSlate-Setup"  // setup hotspot name
+#include "net_portal.h"
 const uint32_t POLL_MS   = 60000;    // poll proxy
 const uint32_t RENDER_MS = 10000;    // full redraw (incl. clock)
 #define INVERT_DISPLAY 1             // 1 = black-on-white (software invert; stock driver)
@@ -69,7 +75,8 @@ struct Data {
 uint32_t lastPoll = 0, lastRender = 0;
 bool timeOK = false;
 int  page = 0;                                      // 0=主页 1=Claude详情 2=天气&室内；BOOT 翻页
-int  lastBtn = HIGH; uint32_t lastBtnMs = 0;
+int  lastBtn = HIGH; uint32_t btnDownMs = 0;
+uint32_t lastOnline = 0; int pollFails = 0;
 
 // ---------------------- SHTC3(标准 Wire) ----------------------
 bool shtc3Read(float& t, float& h) {
@@ -469,7 +476,7 @@ void render() {
 bool poll() {
   if (WiFi.status() != WL_CONNECTED) return false;
   HTTPClient http; http.setConnectTimeout(8000); http.setTimeout(8000);
-  if (!http.begin(PROXY_URL)) return false;
+  if (!http.begin(netProxyUrl())) return false;
   int code = http.GET();
   if (code != 200) { http.end(); g.ok = false; return false; }
   String payload = http.getString(); http.end();
@@ -526,13 +533,28 @@ bool poll() {
   return true;
 }
 
-void connectWiFi() {
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
-  u->clearBuffer(); u->setFont(u8g2_font_helvB12_tf);
-  strCenter(W / 2, H / 2, "connecting wifi...");
+void showNetStatus(const char* l1, const char* l2, const char* l3) {
+  u->clearBuffer();
+  u->setFont(u8g2_font_helvB12_tf);
+  strCenter(W / 2, H / 2 - 24, l1);
+  u->setFont(u8g2_font_6x13_tf);
+  if (l2) strCenter(W / 2, H / 2 + 2, l2);
+  if (l3) strCenter(W / 2, H / 2 + 22, l3);
   flush();
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
+}
+
+void showSetupScreen() {
+  char l2[40]; snprintf(l2, sizeof(l2), "join WiFi: %s", NET_AP_NAME);
+  showNetStatus("SETUP MODE", l2, "then open http://192.168.4.1");
+}
+
+// Boot-time connect: on failure, drop into the captive portal
+// (portal reboots on save or after a 5-minute timeout — never returns)
+void connectWiFi() {
+  showNetStatus("connecting wifi...", netCfg.ssid.c_str(), nullptr);
+  if (netConnect(20000)) { netDiscoverProxy(2); return; }
+  showSetupScreen();
+  netStartPortal();
 }
 
 // ---------------------- setup / loop ----------------------
@@ -547,6 +569,7 @@ void setup() {
   strCenter(W / 2, H / 2, "Claude RLCD booting...");
   flush();
 
+  netBegin();
   connectWiFi();
   configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com");
   struct tm t; timeOK = getLocalTime(&t, 6000);
@@ -559,16 +582,33 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // BOOT 键翻页(按下=LOW，去抖)
+  // BOOT key: short press = next page, hold 3s = setup portal
   int b = digitalRead(BTN_PIN);
-  if (lastBtn == HIGH && b == LOW && now - lastBtnMs > 250) {
-    page = (page + 1) % 3; lastBtnMs = now; render(); lastRender = now;
+  if (lastBtn == HIGH && b == LOW) btnDownMs = now;
+  if (b == LOW && btnDownMs && now - btnDownMs >= 3000) {
+    showSetupScreen();
+    netStartPortal();                              // never returns (reboots on save/timeout)
+  }
+  if (lastBtn == LOW && b == HIGH) {
+    if (btnDownMs && now - btnDownMs >= 30 && now - btnDownMs < 1000) {
+      page = (page + 1) % 3; render(); lastRender = now;
+    }
+    btnDownMs = 0;
   }
   lastBtn = b;
 
   if (now - lastPoll >= POLL_MS) {
-    if (WiFi.status() != WL_CONNECTED) connectWiFi();
-    poll();
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      if (now - lastOnline > 300000UL) ESP.restart();  // offline 5 min -> reboot (falls into portal if WiFi changed)
+    } else {
+      lastOnline = now;
+      if (poll()) pollFails = 0;
+      else if (++pollFails >= 3) {                 // proxy IP may have moved -> rediscover
+        netDiscoverProxy(2);
+        pollFails = 0;
+      }
+    }
     g.roomOk = shtc3Read(g.roomT, g.roomH);
     render();
     lastPoll = lastRender = now;

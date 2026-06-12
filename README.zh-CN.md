@@ -57,13 +57,14 @@ python proxy/claude_limits_proxy.py
 - 用环境变量设**天气城市**(默认上海):
   `WX_LAT=39.90  WX_LON=116.40  WX_CITY="Beijing"  python proxy/claude_limits_proxy.py`
   (你所在城市的经纬度,地图上一查就有)。
-- 查本机**局域网 IP**(`ipconfig` / `ip addr`)——要填进固件。
-- 首次弹窗时**放行防火墙**(8787 端口)。
+- 不用查电脑 IP——屏会用 **UDP 广播自动发现代理**(8788 端口),电脑 IP 变了也能跟上。
+- 首次弹窗时**放行防火墙**(TCP 8787 + UDP 8788)。
 - 直连不到 Anthropic / Open-Meteo(如中国大陆)?设
   `UPSTREAM_PROXY=http://127.0.0.1:7890`(本地 Clash/HTTP 代理)。
 - **安全**:代理只在局域网内服务,且**绝不返回你的 OAuth token**——只给派生的百分比数字。
-  在合租/公共等不可信网络上,设 `PROXY_TOKEN=<密码>`,固件里 `PROXY_URL` 末尾加
-  `?token=<密码>`(或发 `Authorization: Bearer <密码>` 头);没带的请求一律 401。
+  在合租/公共等不可信网络上,设 `PROXY_TOKEN=<密码>`,固件里加
+  `#define NET_PROXY_QUERY "?token=<密码>"`(或发 `Authorization: Bearer <密码>` 头);
+  没带的请求一律 401。
 
 ### 2) 拿显示驱动(一次性)
 
@@ -76,8 +77,11 @@ python proxy/claude_limits_proxy.py
 
 ### 3) 烧固件
 
-Arduino **esp32 core 3.x**。改 `firmware/claude_slate/claude_slate.ino` 顶部
-(`WIFI_SSID`/`WIFI_PASS`——2.4GHz;`PROXY_URL` = `http://<电脑局域网IP>:8787/usage`)。
+Arduino **esp32 core 3.x**。可以改 `firmware/claude_slate/claude_slate.ino` 顶部的
+`NET_DEF_*` 出厂默认值(只支持 2.4GHz),也可以**直接烧**:连不上 WiFi 时屏会自动开
+**配网热点**(`ClaudeSlate-Setup`),手机连上后自动弹出配置页(或手动开
+`http://192.168.4.1`),选好 WiFi 保存即可。代理地址自动发现,不用填 IP。
+之后想换网络,**长按 BOOT 3 秒**随时重新配网。
 
 ```bash
 arduino-cli compile \
