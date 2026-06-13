@@ -474,9 +474,9 @@ void render() {
 
 // ---------------------- 拉数据 ----------------------
 bool poll() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) { g.stale = true; return false; }   // 不再谎报 "live"
   HTTPClient http; http.setConnectTimeout(8000); http.setTimeout(8000);
-  if (!http.begin(netProxyUrl())) return false;
+  if (!http.begin(netProxyUrl())) { g.stale = true; return false; }
   int code = http.GET();
   if (code != 200) { http.end(); g.ok = false; return false; }
   String payload = http.getString(); http.end();
@@ -571,6 +571,7 @@ void setup() {
 
   netBegin();
   connectWiFi();
+  lastOnline = millis();                            // 启动即计时,避免 lastOnline=0 触发误重启
   configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com");
   struct tm t; timeOK = getLocalTime(&t, 6000);
   g.roomOk = shtc3Read(g.roomT, g.roomH);
