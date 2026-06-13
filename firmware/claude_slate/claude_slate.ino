@@ -79,6 +79,17 @@ int  lastBtn = HIGH; uint32_t btnDownMs = 0;
 uint32_t lastOnline = 0; int pollFails = 0;
 
 // ---------------------- SHTC3(标准 Wire) ----------------------
+// CRC-8 (多项式 0x31, 初值 0xFF, MSB 先), 校验每个 2 字节字后的 CRC 字节
+static uint8_t shtc3Crc(uint8_t msb, uint8_t lsb) {
+  uint8_t crc = 0xFF;
+  uint8_t data[2] = {msb, lsb};
+  for (int i = 0; i < 2; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++)
+      crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+  }
+  return crc;
+}
 bool shtc3Read(float& t, float& h) {
   Wire.beginTransmission(SHTC3_ADDR); Wire.write(0x35); Wire.write(0x17);   // wakeup
   if (Wire.endTransmission() != 0) return false;
@@ -88,6 +99,8 @@ bool shtc3Read(float& t, float& h) {
   delay(15);
   if (Wire.requestFrom(SHTC3_ADDR, 6) != 6) return false;
   uint8_t b[6]; for (int i = 0; i < 6; i++) b[i] = Wire.read();
+  // 校验两个字的 CRC(b[2]=温度CRC, b[5]=湿度CRC),单 bit 错误直接丢样本
+  if (shtc3Crc(b[0], b[1]) != b[2] || shtc3Crc(b[3], b[4]) != b[5]) return false;
   uint16_t tr = (b[0] << 8) | b[1], hr = (b[3] << 8) | b[4];
   t = -45.0f + 175.0f * tr / 65535.0f;
   h = 100.0f * hr / 65535.0f;
@@ -464,7 +477,9 @@ void render() {
   u->clearBuffer();
   u->setDrawColor(1);
   g_bat = readBattery();                            // ADC 读电池电压→%
-  struct tm t; bool haveT = timeOK && getLocalTime(&t, 50);
+  // 每帧自取时间:NTP 慢同步也能自愈(不再依赖 boot 时一次性 timeOK 锁存),
+  // 并用 tm_year>120(>2020) 排除未同步的 1970 假时间。
+  struct tm t; bool haveT = getLocalTime(&t, 50) && t.tm_year > 120;
   if (page == 0)      renderPage1(haveT, &t);
   else if (page == 1) renderPage2(haveT, &t);
   else                renderPage3(haveT, &t);

@@ -78,17 +78,21 @@ python proxy/claude_limits_proxy.py
 ```
 
 - Set your **weather city** with env vars (default = Shanghai):
-  `WX_LAT=40.71  WX_LON=-74.01  WX_CITY="New York"  python proxy/claude_limits_proxy.py`
-  (latitude/longitude of your city; find them on any maps site).
+  `WX_LAT=40.71  WX_LON=-74.01  WX_CITY="New York"  WX_TZ="America/New_York"  python proxy/claude_limits_proxy.py`
+  (latitude/longitude of your city; find them on any maps site). **`WX_TZ`** is the
+  [IANA timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) name —
+  set it to match your city or the next‑12h forecast will be shifted by your offset.
 - No need to look up your PC's IP — the screen **finds the proxy by UDP broadcast**
   (port 8788) and follows it if your PC's IP changes.
 - **Allow it through the firewall** (TCP 8787 + UDP 8788) when prompted.
 - Can't reach Anthropic/Open‑Meteo directly (e.g. mainland China)? set
   `UPSTREAM_PROXY=http://127.0.0.1:7890` (a local Clash/HTTP proxy).
-- **Security:** the proxy listens on your LAN and never returns your OAuth token —
-  only derived percentages. On a shared/untrusted network, set `PROXY_TOKEN=<secret>`
-  and set `#define NET_PROXY_QUERY "?token=<secret>"` in the firmware (or send
-  `Authorization: Bearer <secret>`); requests without it get 401.
+- **Security:** the proxy binds **loopback‑only by default** (`BIND_HOST=127.0.0.1`) and
+  never returns your OAuth token — only derived percentages. To let the screen reach it
+  over the LAN, set `BIND_HOST=0.0.0.0` **and** `PROXY_TOKEN=<secret>` (binding to a
+  non‑loopback address without a token is refused — it falls back to 127.0.0.1 with a
+  warning). With a token set, also add `#define NET_PROXY_QUERY "?token=<secret>"` in the
+  firmware (or send `Authorization: Bearer <secret>`); requests without it get 401.
 
 ### 2) Get the display driver (one‑time)
 

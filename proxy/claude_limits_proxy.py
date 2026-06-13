@@ -13,9 +13,13 @@ Claude 用量代理 (订阅版, 双页) —— 给 ESP32-S3 圆屏喂数据。
 
 跑法: python claude_limits_proxy.py    ->  ESP32 GET http://<本机IP>:8787/usage
 环境变量: PORT / CACHE_TTL(限额) / DET_TTL(细节) / UPSTREAM_PROXY / CC_UA / CRED_FILE / CLAUDE_PROJECTS_DIR / PROXY_TOKEN
+          BIND_HOST(默认 127.0.0.1;非回环监听必须配 PROXY_TOKEN)
+天气: WX_LAT / WX_LON / WX_CITY / WX_TZ(IANA 时区名,如 Asia/Shanghai、America/New_York;
+          逐时预报按此时区对齐,设错会半天错位) / WX_TTL
 """
 import os
 import re
+import sys
 import json
 import time
 import glob
@@ -24,6 +28,7 @@ import datetime as dt
 import urllib.request
 import urllib.parse
 import urllib.error
+from zoneinfo import ZoneInfo
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 CRED_FILE    = os.environ.get("CRED_FILE", os.path.expanduser("~/.claude/.credentials.json"))
@@ -31,14 +36,17 @@ PROJECTS_DIR = os.environ.get("CLAUDE_PROJECTS_DIR", os.path.expanduser("~/.clau
 PORT         = int(os.environ.get("PORT", "8787"))
 DISC_PORT    = int(os.environ.get("DISC_PORT", "8788"))   # UDP 自动发现端口(0=关闭)
 SHARED_TOKEN = os.environ.get("PROXY_TOKEN", "").strip()
+BIND_HOST    = os.environ.get("BIND_HOST", "127.0.0.1")   # 默认仅回环;局域网监听需自负其责
 LIM_TTL      = max(60, int(os.environ.get("CACHE_TTL", "180")))
 DET_TTL      = max(3,  int(os.environ.get("DET_TTL", "8")))
 CC_UA        = os.environ.get("CC_UA", "claude-code/1.0.0")
 
 UPSTREAM_PROXY = os.environ.get("UPSTREAM_PROXY", "").strip()  # 默认直连;需走代理时设 UPSTREAM_PROXY=http://127.0.0.1:7890
+# 空 UPSTREAM_PROXY 时用空 ProxyHandler 强制真直连(忽略 OS 的 http(s)_proxy 环境代理),
+# 否则系统代理会悄悄拦截带 OAuth token 的上游请求。
 _opener = urllib.request.build_opener(
     urllib.request.ProxyHandler({"http": UPSTREAM_PROXY, "https": UPSTREAM_PROXY})) if UPSTREAM_PROXY \
-    else urllib.request.build_opener()
+    else urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _lim = {"ts": 0.0, "data": None}
@@ -59,9 +67,15 @@ _direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 直连
 
 
 def _safe_err(msg):
-    """返回给客户端的错误信息脱敏:本地文件路径(含用户名)只留给控制台,不出网。"""
-    msg = re.sub(r"[A-Za-z]:\\[^\s'\"]+", "<path>", str(msg))
-    return re.sub(r"(?:/[\w.~-]+){2,}", "<path>", msg)[:140]
+    """返回给客户端的错误信息脱敏:本地文件路径(含用户名)/token 只留给控制台,不出网。"""
+    msg = str(msg)
+    msg = re.sub(r"Bearer\s+\S+", "Bearer <redacted>", msg)   # 防 token 经 err 外泄
+    # Windows 盘符路径:遇引号/换行才停(原 \S+ 会被路径里的空格截断,导致用户名泄露)
+    msg = re.sub(r"[A-Za-z]:\\[^'\"\r\n]+", "<path>", msg)
+    # POSIX 多级路径 + 已知敏感路径(凭据文件 / 家目录 ~)
+    msg = re.sub(r"(?:/[\w.~ -]+){2,}", "<path>", msg)
+    msg = msg.replace(CRED_FILE, "<path>").replace(os.path.expanduser("~"), "<path>")
+    return msg[:140]
 
 
 # ---------------- 限额 (OAuth) ----------------
@@ -88,10 +102,16 @@ def _pct(node):
         return -1.0
 
 
+# token 仅允许可见 ASCII(header 安全字符):非法字符直接拒,避免拼进 header/err 外泄
+_TOK_RE = re.compile(r"^[\x21-\x7e]+$")
+
+
 def fetch_limits():
     tok, sub = _read_token()
     if not tok:
         return {"ok": False, "err": "no oauth token (credentials.json)"}
+    if not _TOK_RE.match(tok):
+        return {"ok": False, "err": "invalid oauth token format"}
     req = urllib.request.Request(USAGE_URL, headers={
         "Authorization": "Bearer " + tok,
         "anthropic-beta": "oauth-2025-04-20",
@@ -141,7 +161,8 @@ def cached_limits():
         return {"ok": False, "err": msg}
     except Exception as e:  # noqa: BLE001
         print("[ERR limits]", str(e)[:140])
-        msg = _safe_err(e)
+        # 通用异常给客户端固定文案(不含路径/token/内部细节),详细信息只进控制台
+        msg = "upstream error"
         if _lim["data"]:
             s = dict(_lim["data"]); s["stale"] = True; s["err"] = msg; return s
         return {"ok": False, "err": msg}
@@ -390,7 +411,10 @@ def fetch_weather():
     htimes = hr.get("time", []); htemps = hr.get("temperature_2m", []); hprec = hr.get("precipitation_probability", [])
     h0 = 0
     try:
-        nowh = dt.datetime.now().replace(minute=0, second=0, microsecond=0)
+        # Open-Meteo 的 hourly 时间戳是 WX_TZ 本地、无时区(naive)的整点;
+        # 必须用 WX_TZ 下的"现在"对齐,否则非上海时区(如 README 的纽约)会半天错位。
+        nowh = dt.datetime.now(ZoneInfo(WX_TZ)).replace(
+            minute=0, second=0, microsecond=0, tzinfo=None)
         for i, ts in enumerate(htimes):
             if dt.datetime.fromisoformat(ts) >= nowh:
                 h0 = i; break
@@ -487,8 +511,24 @@ def _discovery_loop():
             time.sleep(0.5)
 
 
+def _resolve_bind_host():
+    """默认仅回环;非回环监听必须配 PROXY_TOKEN,否则强制退回 127.0.0.1 并大声告警。"""
+    host = BIND_HOST
+    loopback = host in ("127.0.0.1", "::1", "localhost")
+    if not loopback and not SHARED_TOKEN:
+        sys.stderr.write(
+            f"\n[WARN] BIND_HOST={host} 暴露在局域网但未设 PROXY_TOKEN —— "
+            f"任何同网设备都能读你的 Claude 用量。已强制退回 127.0.0.1。\n"
+            f"       如确需局域网监听,请同时设置 PROXY_TOKEN=<secret>。\n\n")
+        return "127.0.0.1"
+    if not loopback:
+        sys.stderr.write(f"[WARN] 正在 {host} 监听局域网(已配 PROXY_TOKEN 鉴权)。\n")
+    return host
+
+
 if __name__ == "__main__":
-    print(f"Claude 用量代理(双页) → http://0.0.0.0:{PORT}/usage  (UA={CC_UA}, 限额{LIM_TTL}s 细节{DET_TTL}s)")
+    BIND_HOST = _resolve_bind_host()
+    print(f"Claude 用量代理(双页) → http://{BIND_HOST}:{PORT}/usage  (UA={CC_UA}, 限额{LIM_TTL}s 细节{DET_TTL}s)")
     print(f"  凭据: {CRED_FILE}")
     print(f"  日志: {PROJECTS_DIR}")
     if DISC_PORT:
@@ -499,6 +539,6 @@ if __name__ == "__main__":
     _wx_busy = True                                  # 天气也预热,且永不阻塞请求
     threading.Thread(target=_wx_compute, daemon=True).start()
     try:
-        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+        ThreadingHTTPServer((BIND_HOST, PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         print("\nbye")
